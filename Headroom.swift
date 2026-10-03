@@ -74,8 +74,10 @@ struct Sample {
     var pressure: Int32 = 1  // kernel level: 1 normal, 2 warn, 4 critical
     var memUsed = 0.0  // GB, the "Memory Used" Activity Monitor shows
     var total = 0.0  // GB
+    var appMem = 0.0, wired = 0.0, compressed = 0.0  // GB, the parts of memUsed
     var swapUsed = 0.0  // GB
-    var cpuTicks: (busy: UInt64, total: UInt64) = (0, 0)
+    var cpuTicks: (user: UInt64, system: UInt64, idle: UInt64) = (0, 0, 0)
+    var thermal = ProcessInfo.ThermalState.nominal  // fair, serious, critical = throttling
 }
 
 struct Container: Identifiable {
@@ -163,10 +165,11 @@ func sampleSystem() -> Sample {
         }
     }
     if kr == KERN_SUCCESS {
-        let page = Double(vm_kernel_page_size)
-        let app = Double(vm.internal_page_count) - Double(vm.purgeable_count)
-        let pages = app + Double(vm.wire_count) + Double(vm.compressor_page_count)
-        s.memUsed = pages * page / gb
+        let page = Double(vm_kernel_page_size) / gb
+        s.appMem = (Double(vm.internal_page_count) - Double(vm.purgeable_count)) * page
+        s.wired = Double(vm.wire_count) * page
+        s.compressed = Double(vm.compressor_page_count) * page
+        s.memUsed = s.appMem + s.wired + s.compressed
     }
 
     var cpu = host_cpu_load_info()
@@ -179,10 +182,20 @@ func sampleSystem() -> Sample {
     }
     if ckr == KERN_SUCCESS {
         let t = cpu.cpu_ticks
-        let busy = UInt64(t.0) + UInt64(t.1) + UInt64(t.3)  // user, system, nice
-        s.cpuTicks = (busy, busy + UInt64(t.2))  // + idle
+        s.cpuTicks = (UInt64(t.0) + UInt64(t.3), UInt64(t.1), UInt64(t.2))  // user + nice, system, idle
     }
+    s.thermal = ProcessInfo.processInfo.thermalState
     return s
+}
+
+// Free and total space on the startup disk, in GB as Finder counts them.
+// "Important usage" includes space macOS can purge, which is what Finder shows.
+func sampleDisk() -> (free: Double, total: Double)? {
+    let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]
+    guard let v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: keys),
+          let free = v.volumeAvailableCapacityForImportantUsage, let total = v.volumeTotalCapacity
+    else { return nil }
+    return (Double(free) / 1e9, Double(total) / 1e9)
 }
 
 // MARK: - Per-app scan (libproc, ~3 ms for all processes)
@@ -420,6 +433,9 @@ final class Model: ObservableObject {
     private(set) var containers: [Container] = []  // running
     private(set) var reasons: [String] = []
     private(set) var cause = Cause.none
+    private(set) var cpuSplit: (user: Double, system: Double) = (0, 0)  // percent of the whole Mac
+    private(set) var disk: (free: Double, total: Double)?
+    private var tickCount = 0
     private(set) var dockerState = DockerState.off
     private var dockerFailures = 0
 
@@ -431,7 +447,7 @@ final class Model: ObservableObject {
     @Published var confirmRestart = false
 
     private(set) var isOpen = false
-    private var lastTicks: (busy: UInt64, total: UInt64)?
+    private var lastTicks: (user: UInt64, system: UInt64, idle: UInt64)?
     private var systemTimer: Timer?
     private var appTimer: Timer?
     private var openTicks = 0
@@ -495,11 +511,18 @@ final class Model: ObservableObject {
     private func tickSystem() {
         let s = sampleSystem()
         sample = s
-        if let last = lastTicks, s.cpuTicks.total > last.total {
-            let pct = Double(s.cpuTicks.busy - last.busy) / Double(s.cpuTicks.total - last.total) * 100
-            push(&cpuHistory, pct)
+        if let last = lastTicks {
+            let user = Double(s.cpuTicks.user &- last.user), system = Double(s.cpuTicks.system &- last.system)
+            let all = user + system + Double(s.cpuTicks.idle &- last.idle)
+            if all > 0 {
+                cpuSplit = (user / all * 100, system / all * 100)
+                push(&cpuHistory, cpuSplit.user + cpuSplit.system)
+            }
         }
         lastTicks = s.cpuTicks
+        // Disk space barely moves, so once a minute is plenty.
+        if tickCount % 12 == 0 { disk = sampleDisk() }
+        tickCount += 1
         push(&memHistory, s.memUsed)
         push(&swapHistory, s.swapUsed)
         judge()
@@ -601,6 +624,22 @@ final class Model: ObservableObject {
             v = max(v, .busy); why.append(String(format: "CPU working hard (%.0f%%)", cpu))
             if cause == .none { cause = .cpu }
         }
+        switch sample.thermal {
+        case .critical:
+            v = .slow; why.append("Mac is very hot, CPU heavily throttled")
+            if cause == .none { cause = .cpu }
+        case .serious:
+            v = max(v, .busy); why.append("Mac is hot, CPU throttled")
+            if cause == .none { cause = .cpu }
+        default: break
+        }
+        if let disk {
+            if disk.free < 5 {
+                v = .slow; why.append(String(format: "Only %.0f GB free on disk", disk.free))
+            } else if disk.free < 10 {
+                v = max(v, .busy); why.append(String(format: "Disk almost full, %.0f GB free", disk.free))
+            }
+        }
         reasons = why
         self.cause = cause
         if status.verdict != v { status.verdict = v }
@@ -620,9 +659,10 @@ final class Model: ObservableObject {
             guard let top = candidates.max(by: { $0.mb < $1.mb }), top.mb >= 500 else { return nil }
             return "\(top.name) is using \(formatMB(top.mb))"
         case .cpu:
-            guard let top = candidates.max(by: { $0.cpu < $1.cpu }), top.cpu >= 20 else { return nil }
             // Per-core percentages pass 100 ("773%"); a share of the whole Mac reads better here.
+            // Under 10% it isn't a culprit, e.g. when heat alone is the cause.
             let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
+            guard let top = candidates.max(by: { $0.cpu < $1.cpu }), top.cpu / cores >= 10 else { return nil }
             return String(format: "%@ is using %.0f%% of your CPU", top.name, min(top.cpu / cores, 100))
         }
     }
@@ -935,11 +975,14 @@ struct ContentView: View {
                     .animation(.snappy, value: v)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(v.title).font(.headline)
-                    Text(model.reasons.isEmpty ? "Plenty of memory and CPU to spare"
-                                               : model.reasons.joined(separator: " · "))
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                    // One line per reason: several can be true at once.
+                    ForEach(model.reasons.isEmpty ? ["Plenty of memory and CPU to spare"] : model.reasons,
+                            id: \.self) { reason in
+                        Text(reason)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                     if let culprit = model.culprit {
                         Text(culprit)
                             .font(.subheadline.weight(.medium))
@@ -956,22 +999,44 @@ struct ContentView: View {
         let s = model.sample
         let swapWord = model.swapTrend > 0.06 ? "growing"
                      : model.swapTrend < -0.06 ? "shrinking" : "steady"
+        let memColor: Color = s.pressure >= 4 ? .red : s.pressure >= 2 ? .orange : .green
         Tile(label: "Memory", value: String(format: "%.1f GB", s.memUsed),
              detail: model.pressureLabel,
              detailColor: s.pressure >= 4 ? .red : s.pressure >= 2 ? .warnText : .secondary,
-             history: model.memHistory, maxY: s.total,
-             color: s.pressure >= 4 ? .red : s.pressure >= 2 ? .orange : .green)
+             history: model.memHistory, maxY: s.total, color: memColor,
+             parts: [(s.appMem, memColor), (s.wired, .blue), (s.compressed, .purple)], partsTotal: s.total,
+             partsHelp: String(format: "App %.1f GB · Wired %.1f GB · Compressed %.1f GB · Free and cache %.1f GB",
+                               s.appMem, s.wired, s.compressed, max(s.total - s.memUsed, 0)))
             .help(String(format: "%.1f of %.0f GB in use. Pressure: %@", s.memUsed, s.total,
                          model.pressureLabel.lowercased()))
+
+        // Heat replaces the core count when macOS is throttling the CPU.
+        let heat: (String, Color)? = switch s.thermal {
+        case .fair: ("Warm", .secondary)
+        case .serious: ("Hot, throttled", .warnText)
+        case .critical: ("Very hot, throttled", .red)
+        default: nil
+        }
         Tile(label: "CPU", value: String(format: "%.0f%%", model.cpuNow),
-             detail: "\(ProcessInfo.processInfo.activeProcessorCount) cores",
-             detailColor: .secondary,
+             detail: heat?.0 ?? "\(ProcessInfo.processInfo.activeProcessorCount) cores",
+             detailColor: heat?.1 ?? .secondary,
              history: model.cpuHistory, maxY: 100,
-             color: model.cpuNow > 90 ? .red : model.cpuNow > 70 ? .orange : .blue)
+             color: model.cpuNow > 90 ? .red : model.cpuNow > 70 ? .orange : .blue,
+             parts: [(model.cpuSplit.user, .blue), (model.cpuSplit.system, .red)], partsTotal: 100,
+             partsHelp: String(format: "User %.0f%% · System %.0f%% · Idle %.0f%%", model.cpuSplit.user,
+                               model.cpuSplit.system, max(100 - model.cpuNow, 0)))
+
+        // Swap lives on the startup disk, so this tile also watches disk space.
+        let disk = model.disk
+        let diskLow = (disk?.free ?? .infinity) < 10
+        let diskColor: Color = (disk?.free ?? .infinity) < 5 ? .red : diskLow ? .orange : .gray
         Tile(label: "Swap", value: String(format: "%.1f GB", s.swapUsed),
-             detail: swapWord, detailColor: swapWord == "growing" ? .warnText : .secondary,
+             detail: diskLow ? String(format: "%.0f GB disk free", disk!.free) : swapWord,
+             detailColor: diskLow ? .warnText : swapWord == "growing" ? .warnText : .secondary,
              history: model.swapHistory, maxY: max(1, (model.swapHistory.max() ?? 0) * 1.2),
-             color: swapWord == "growing" ? .orange : .gray)
+             color: swapWord == "growing" ? .orange : .gray,
+             parts: disk.map { [($0.total - $0.free, diskColor)] } ?? [], partsTotal: disk?.total ?? 1,
+             partsHelp: disk.map { String(format: "Startup disk: %.0f GB free of %.0f GB", $0.free, $0.total) } ?? "")
     }
 
     // MARK: Apps
@@ -1071,6 +1136,9 @@ struct Tile: View {
     let history: [Double]
     let maxY: Double
     let color: Color
+    var parts: [(Double, Color)] = []  // what the value is made of, drawn as a thin bar
+    var partsTotal: Double = 1
+    var partsHelp = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -1080,7 +1148,10 @@ struct Tile: View {
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
-            Text(detail).font(.caption2).foregroundStyle(detailColor)
+            Text(detail).font(.caption2).foregroundStyle(detailColor).lineLimit(1)
+            PartsBar(parts: parts, total: partsTotal)
+                .padding(.top, 5)
+                .help(partsHelp)
             Sparkline(values: history, maxY: maxY, color: color)
                 .frame(height: 20)
                 .padding(.top, 4)
@@ -1092,6 +1163,29 @@ struct Tile: View {
             shape.fill(Color.card)
             shape.strokeBorder(Color.cardEdge, lineWidth: 0.5)
         }
+    }
+}
+
+// A thin stacked bar: each part's share of the total, the rest left as track.
+struct PartsBar: View {
+    let parts: [(Double, Color)]
+    let total: Double
+
+    var body: some View {
+        GeometryReader { g in
+            HStack(spacing: 1) {
+                ForEach(parts.indices, id: \.self) { i in
+                    let share = max(parts[i].0, 0) / max(total, 0.001)
+                    if share > 0.005 {
+                        Rectangle().fill(parts[i].1).frame(width: g.size.width * min(share, 1))
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .background(Color.track)
+            .clipShape(Capsule())
+        }
+        .frame(height: 4)
     }
 }
 

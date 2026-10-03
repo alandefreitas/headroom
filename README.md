@@ -12,8 +12,8 @@ A tiny macOS menu bar app that tells you if your Mac is fast or slow right now, 
 
 ## What it shows
 
-- **Status line:** *Running smoothly*, *A bit busy* or *Slowing down*, plus the reason and the app responsible, like "Chrome is using 6.1 GB". It goes by macOS's own memory pressure level, whether swap is growing, and whether CPU stays high for 30 seconds.
-- **Memory, CPU and swap:** each with a graph of the last 15 minutes.
+- **Status line:** *Running smoothly*, *A bit busy* or *Slowing down*, plus the reason and the app responsible, like "Chrome is using 6.1 GB". It goes by macOS's own memory pressure level, whether swap is growing, whether CPU stays high for 30 seconds, whether macOS is throttling a hot CPU, and whether the disk is almost full.
+- **Memory, CPU and swap:** each with a graph of the last 15 minutes and a breakdown bar. Memory splits into app, wired and compressed. CPU splits into user and system time. Swap shows how full the startup disk is, since that's where swap lives.
 - **Top apps:** the apps using the most memory or CPU, with helper processes counted under their app. Hover a row to quit the app.
 - **Docker:** containers grouped by compose project, if Docker is running. Hover to stop or start them. When the Docker VM holds a lot more memory than its containers use, or Docker stops responding, Headroom offers to restart Docker, then starts the containers that were running.
 
