@@ -87,8 +87,9 @@ struct Container: Identifiable {
     let project: String  // compose project, "" if none
     let port: Int?  // first published host port
     let uptime: String  // "8 days", "31 min"
-    var cpu: Double? = nil
+    var cpu: Double? = nil  // percent of one core, like docker stats
     var mb: Double? = nil
+    var restarting = false  // crash-looping under a restart policy
 
     // Databases and caches go first when starting things back up.
     var isInfra: Bool {
@@ -364,7 +365,11 @@ final class DockerScanner: @unchecked Sendable {
     private var lastCPU: [String: (container: UInt64, system: UInt64)] = [:]
 
     func scan() -> [Container]? {
-        guard let list = Docker.json("/containers/json") as? [[String: Any]] else { return nil }
+        // Running plus restarting: a crash loop is exactly what we want to catch.
+        let filter = #"{"status":["running","restarting"]}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        guard let list = Docker.json("/containers/json?filters=\(filter)") as? [[String: Any]]
+        else { return nil }
         var next: [String: (UInt64, UInt64)] = [:]
         let containers: [Container] = list.compactMap { c in
             guard let name = (c["Names"] as? [String])?.first?.trimmingCharacters(in: ["/"])
@@ -375,6 +380,7 @@ final class DockerScanner: @unchecked Sendable {
                 name: name, image: c["Image"] as? String ?? "",
                 project: labels["com.docker.compose.project"] ?? "", port: port,
                 uptime: Docker.shortUptime(c["Status"] as? String ?? ""))
+            item.restarting = (c["State"] as? String) == "restarting"
 
             if let st = Docker.json("/containers/\(name)/stats?stream=false&one-shot=true")
                 as? [String: Any] {
@@ -589,7 +595,7 @@ final class Model: ObservableObject {
     }
 
     private func rememberRunning(_ list: [Container]) {
-        let names = list.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
+        let names = list.filter { !$0.restarting }.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
         if names != lastRunning { UserDefaults.standard.set(names, forKey: Pref.lastContainers) }
     }
 
@@ -657,13 +663,27 @@ final class Model: ObservableObject {
             return nil
         case .memory:
             guard let top = candidates.max(by: { $0.mb < $1.mb }), top.mb >= 500 else { return nil }
+            if top.isDockerVM, let c = containers.max(by: { ($0.mb ?? 0) < ($1.mb ?? 0) }), (c.mb ?? 0) > 0 {
+                return "Docker is using \(formatMB(top.mb)), most of it \(c.name)"
+            }
             return "\(top.name) is using \(formatMB(top.mb))"
         case .cpu:
             // Per-core percentages pass 100 ("773%"); a share of the whole Mac reads better here.
             // Under 10% it isn't a culprit, e.g. when heat alone is the cause.
             let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
-            guard let top = candidates.max(by: { $0.cpu < $1.cpu }), top.cpu / cores >= 10 else { return nil }
-            return String(format: "%@ is using %.0f%% of your CPU", top.name, min(top.cpu / cores, 100))
+            let top = candidates.max(by: { $0.cpu < $1.cpu })
+            // CPU we can't attribute to your apps belongs to macOS itself: Spotlight,
+            // WindowServer, kernel_task. Those run as root, so we can't see them one by one.
+            let system = cpuNow * cores - candidates.reduce(0) { $0 + $1.cpu }
+            if system / cores >= 10 && system > (top?.cpu ?? 0) {
+                return String(format: "macOS system processes are using %.0f%% of your CPU", min(system / cores, 100))
+            }
+            guard let top, top.cpu / cores >= 10 else { return nil }
+            let share = min(top.cpu / cores, 100)
+            if top.isDockerVM, let c = containers.max(by: { ($0.cpu ?? 0) < ($1.cpu ?? 0) }), (c.cpu ?? 0) >= 5 {
+                return String(format: "Docker (%@) is using %.0f%% of your CPU", c.name, share)
+            }
+            return String(format: "%@ is using %.0f%% of your CPU", top.name, share)
         }
     }
 
@@ -986,7 +1006,8 @@ struct ContentView: View {
                     if let culprit = model.culprit {
                         Text(culprit)
                             .font(.subheadline.weight(.medium))
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -1343,7 +1364,8 @@ struct DockerCard: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     if let vm = model.dockerVM {
-                        Text(String(format: "%@ · %.0f%% CPU", formatMB(vm.mb), vm.cpu))
+                        let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
+                        Text(String(format: "%@ · %.0f%% CPU", formatMB(vm.mb), min(vm.cpu / cores, 100)))
                             .font(.caption)
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
@@ -1364,6 +1386,7 @@ struct DockerCard: View {
                 } else if model.dockerState == .unresponsive {
                     DockerDownNote(model: model)
                 } else {
+                    CrashNote(model: model)
                     ForEach(model.projects, id: \.name) { project in
                         ProjectRow(name: project.name, items: project.items, model: model)
                         if model.expanded.contains(project.name) {
@@ -1407,7 +1430,8 @@ struct ProjectRow: View {
             HStack(spacing: 3) {
                 ForEach(items) { c in
                     Circle()
-                        .fill(model.isStopped(c) ? Color.secondary.opacity(0.35) : Color.green)
+                        .fill(c.restarting ? Color.red
+                              : model.isStopped(c) ? Color.secondary.opacity(0.35) : Color.green)
                         .frame(width: 5, height: 5)
                 }
             }
@@ -1452,7 +1476,7 @@ struct ContainerRow: View {
 
         HStack(spacing: 8) {
             Circle()
-                .fill(stopped ? Color.secondary.opacity(0.35) : Color.green)
+                .fill(c.restarting ? Color.red : stopped ? Color.secondary.opacity(0.35) : Color.green)
                 .frame(width: 6, height: 6)
                 .frame(width: 18)
             Text(c.name).lineLimit(1).truncationMode(.middle)
@@ -1465,8 +1489,27 @@ struct ContainerRow: View {
                     stopped ? model.start([c.name]) : model.stop([c.name])
                 }
                 .buttonStyle(.hoverSmall)
-            } else if let port = c.port, !stopped {
-                Text(":\(port)").foregroundStyle(.secondary).monospacedDigit()
+            } else if c.restarting {
+                Text("Crashing").foregroundStyle(Color.warnText)
+            } else {
+                if let cpu = c.cpu, cpu >= 25, !stopped {
+                    Text(String(format: "%.0f%%", cpu))
+                        .foregroundStyle(Color.warnText)
+                        .monospacedDigit()
+                        .help("CPU, where 100% is one core")
+                }
+                if let port = c.port, !stopped {
+                    if c.isInfra {
+                        Text(":\(port)").foregroundStyle(.secondary).monospacedDigit()
+                    } else {
+                        // Web containers open in the browser; databases have nothing to show.
+                        Button(":\(port)") {
+                            NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
+                        }
+                        .buttonStyle(.hoverSmall)
+                        .help("Open localhost:\(port)")
+                    }
+                }
             }
             Text(stopped ? "Stopped" : c.mb.map(formatMB) ?? "")
                 .monospacedDigit()
@@ -1490,6 +1533,34 @@ struct ContainerRow: View {
         var parts = [c.shortImage, "up " + c.uptime]
         if let cpu = c.cpu { parts.append(String(format: "%.0f%% CPU", cpu)) }
         return parts.joined(separator: " · ")
+    }
+}
+
+// A container stuck restarting burns CPU and can kick off other work on every
+// start (on Sep 24 one re-ran a chown that made Spotlight re-index 217 PDFs a minute).
+struct CrashNote: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        let crashing = model.containers.filter(\.restarting)
+        if !crashing.isEmpty {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(Color.warnText)
+                Text(crashing.count == 1 ? "\(crashing[0].name) keeps crashing"
+                     : "\(crashing.count) containers keep crashing")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Button(crashing.count == 1 ? "Stop" : "Stop All") { model.stop(crashing.map(\.name)) }
+                    .buttonStyle(.hoverSmall)
+            }
+            .font(.callout)
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.12)))
+            .padding(.bottom, 4)
+            .help("Docker keeps restarting \(crashing.count == 1 ? "this container" : "these containers") because \(crashing.count == 1 ? "it exits" : "they exit") on start. Stopping ends the loop until you start \(crashing.count == 1 ? "it" : "them") again.")
+        }
     }
 }
 
