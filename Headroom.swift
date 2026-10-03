@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Darwin
+import ServiceManagement
 
 let gb = 1_073_741_824.0
 let dockerSocket = NSHomeDirectory() + "/.docker/run/docker.sock"
@@ -102,6 +103,37 @@ struct Container: Identifiable {
 func formatMB(_ mb: Double) -> String {
     // From 1000 MB up, GB reads better than "1010 MB".
     mb >= 1000 ? String(format: "%.1f GB", mb / 1024) : String(format: "%.0f MB", mb)
+}
+
+// MARK: - Settings
+
+// UserDefaults keys. Views read them with @AppStorage; the model reads them directly.
+enum Pref {
+    static let menuText = "menuText"  // MenuText raw value
+    static let appCount = "appCount"  // apps listed in the popover
+    static let showDocker = "showDocker"
+    static let lastContainers = "lastRunningContainers"  // offered back after Docker breaks
+}
+
+// What sits next to the capsule in the menu bar.
+enum MenuText: String, CaseIterable {
+    case none, memory, cpu
+
+    var label: String {
+        switch self {
+        case .none: return "Icon only"
+        case .memory: return "Icon and MEM %"
+        case .cpu: return "Icon and CPU %"
+        }
+    }
+}
+
+enum LoginItem {
+    static var status: SMAppService.Status { SMAppService.mainApp.status }
+
+    static func set(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+    }
 }
 
 // MARK: - System sample (kernel counters, microseconds)
@@ -362,7 +394,13 @@ final class DockerScanner: @unchecked Sendable {
 @MainActor
 final class Status: ObservableObject {
     @Published var verdict = Verdict.smooth
+    @Published var text = ""  // optional percentage next to the capsule
 }
+
+enum DockerState { case off, up, unresponsive }
+
+// What's behind the verdict, so the header can name the app responsible.
+enum Cause { case none, memory, cpu }
 
 @MainActor
 final class Model: ObservableObject {
@@ -381,6 +419,9 @@ final class Model: ObservableObject {
     private(set) var apps: [AppUsage] = []
     private(set) var containers: [Container] = []  // running
     private(set) var reasons: [String] = []
+    private(set) var cause = Cause.none
+    private(set) var dockerState = DockerState.off
+    private var dockerFailures = 0
 
     // State the user changes.
     @Published var stoppedHere: [Container] = []  // stopped from this popover, offered for Start
@@ -462,28 +503,71 @@ final class Model: ObservableObject {
         push(&memHistory, s.memUsed)
         push(&swapHistory, s.swapUsed)
         judge()
+        refreshLabel()
         if isOpen { objectWillChange.send() }
+    }
+
+    func refreshLabel() {
+        let mode = MenuText(rawValue: UserDefaults.standard.string(forKey: Pref.menuText) ?? "") ?? .none
+        let text: String
+        switch mode {
+        case .none: text = ""
+        // Labeled, so a bare percentage is never a guess.
+        case .memory: text = String(format: "MEM %.0f%%", sample.memUsed / max(sample.total, 1) * 100)
+        case .cpu: text = String(format: "CPU %.0f%%", cpuNow)
+        }
+        if status.text != text { status.text = text }
     }
 
     func scanApps() {
         guard isOpen else { return }
         let withDocker = restartStatus == nil && openTicks % 2 == 0  // every 4 s
         openTicks += 1
+        // Docker Desktop running is what matters, not the VM: when the VM dies
+        // the app stays up and its socket stops answering.
+        let desktopRunning = !NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.docker.docker").isEmpty
         queue.async { [procs, docker] in
             let apps = procs.scan()
-            let hasVM = apps.contains { $0.isDockerVM }
-            let containers = withDocker && hasVM ? docker.scan() : nil
+            let containers = withDocker && desktopRunning ? docker.scan() : nil
             DispatchQueue.main.async {
                 self.apps = apps
-                if !hasVM && self.restartStatus == nil {
+                if self.restartStatus != nil {
+                    // leave Docker alone mid-restart
+                } else if !desktopRunning {
                     self.containers = []
+                    self.dockerState = .off
+                    self.dockerFailures = 0
                 } else if let containers {
                     self.containers = containers
                     self.stoppedHere.removeAll { c in containers.contains { $0.name == c.name } }
+                    self.dockerState = .up
+                    self.dockerFailures = 0
+                    self.rememberRunning(containers)
+                } else if withDocker {
+                    // Two misses in a row (8 s), so Docker starting up doesn't count.
+                    self.dockerFailures += 1
+                    if self.dockerFailures >= 2 {
+                        self.dockerState = .unresponsive
+                        self.containers = []
+                    }
                 }
                 if self.isOpen { self.objectWillChange.send() }
             }
         }
+    }
+
+    // MARK: Docker memory
+
+    // The containers running at the last good scan, databases first. If Docker
+    // breaks, these are what a restart brings back.
+    var lastRunning: [String] {
+        UserDefaults.standard.stringArray(forKey: Pref.lastContainers) ?? []
+    }
+
+    private func rememberRunning(_ list: [Container]) {
+        let names = list.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
+        if names != lastRunning { UserDefaults.standard.set(names, forKey: Pref.lastContainers) }
     }
 
     private func push(_ a: inout [Double], _ v: Double) {
@@ -496,31 +580,52 @@ final class Model: ObservableObject {
     private func judge() {
         var v = Verdict.smooth
         var why: [String] = []
+        var cause = Cause.none
         let recentCPU = cpuHistory.suffix(Int(30 / Self.tick))
         let cpu = recentCPU.isEmpty ? 0 : recentCPU.reduce(0, +) / Double(recentCPU.count)
 
         switch sample.pressure {
-        case 4: v = .slow; why.append("Memory is critically low")
-        case 2: v = max(v, .busy); why.append("Memory is getting tight")
+        case 4: v = .slow; why.append("Memory is critically low"); cause = .memory
+        case 2: v = max(v, .busy); why.append("Memory is getting tight"); cause = .memory
         default: break
         }
         if swapTrend > 0.25 {
-            v = .slow; why.append("Swapping to disk")
+            v = .slow; why.append("Swapping to disk"); cause = .memory
         } else if swapTrend > 0.06 {
-            v = max(v, .busy); why.append("Swap is growing")
+            v = max(v, .busy); why.append("Swap is growing"); cause = .memory
         }
         if cpu > 90 {
             v = .slow; why.append(String(format: "CPU maxed out (%.0f%%)", cpu))
+            if cause == .none { cause = .cpu }
         } else if cpu > 70 {
             v = max(v, .busy); why.append(String(format: "CPU working hard (%.0f%%)", cpu))
+            if cause == .none { cause = .cpu }
         }
         reasons = why
+        self.cause = cause
         if status.verdict != v { status.verdict = v }
     }
 
     // MARK: Docker
 
     var dockerVM: AppUsage? { apps.first { $0.isDockerVM } }
+
+    // The app most responsible for the current verdict, e.g. "Chrome is using 6.1 GB".
+    var culprit: String? {
+        let candidates = apps.filter { !$0.isSystem && $0.name != "Headroom" }
+        switch cause {
+        case .none:
+            return nil
+        case .memory:
+            guard let top = candidates.max(by: { $0.mb < $1.mb }), top.mb >= 500 else { return nil }
+            return "\(top.name) is using \(formatMB(top.mb))"
+        case .cpu:
+            guard let top = candidates.max(by: { $0.cpu < $1.cpu }), top.cpu >= 20 else { return nil }
+            // Per-core percentages pass 100 ("773%"); a share of the whole Mac reads better here.
+            let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
+            return String(format: "%@ is using %.0f%% of your CPU", top.name, min(top.cpu / cores, 100))
+        }
+    }
 
     // Running and just-stopped containers, grouped by compose project.
     var projects: [(name: String, items: [Container])] {
@@ -574,13 +679,16 @@ final class Model: ObservableObject {
     // without a restart policy stay down after that, so start them again ourselves.
     func restartDocker() {
         confirmRestart = false
-        let names = containers.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
+        let names = containers.isEmpty ? lastRunning
+                                       : containers.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
         restartStatus = "Quitting Docker…"
+        dockerState = .up
+        dockerFailures = 0
         DispatchQueue.global(qos: .userInitiated).async {
             NSAppleScript(source: "quit app \"Docker\"")?.executeAndReturnError(nil)
             var waited = 0
             while Docker.isUp && waited < 60 { Thread.sleep(forTimeInterval: 1); waited += 1 }
-            Thread.sleep(forTimeInterval: 2)
+            Thread.sleep(forTimeInterval: 5)  // let the backend exit before reopening
 
             DispatchQueue.main.async {
                 self.restartStatus = "Starting Docker…"
@@ -781,23 +889,35 @@ struct ContentView: View {
     @ObservedObject var model: Model
     @State private var sort = SortKey.memory
     @State private var confirmQuit = false
+    @State private var showSettings = false
+    @AppStorage(Pref.appCount) private var appCount = 5
+    @AppStorage(Pref.showDocker) private var showDocker = true
 
     var body: some View {
         VStack(spacing: 8) {
-            header
-            HStack(spacing: 8) { tiles }
-            appsCard
-            if model.dockerVM != nil || model.restartStatus != nil {
-                DockerCard(model: model)
+            if showSettings {
+                SettingsView(model: model) { showSettings = false }
+            } else {
+                header
+                HStack(spacing: 8) { tiles }
+                appsCard
+                if showDocker && (model.dockerState != .off || model.restartStatus != nil) {
+                    DockerCard(model: model)
+                }
+                footer
             }
-            footer
         }
         .padding(10)
         .frame(width: 340)
-        .onAppear { model.opened() }
+        .onAppear {
+            model.opened()
+            // Open on the list that shows the culprit.
+            sort = model.cause == .cpu ? .cpu : .memory
+        }
         .onDisappear {
             model.closed()
             confirmQuit = false
+            showSettings = false
         }
     }
 
@@ -820,6 +940,11 @@ struct ContentView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                    if let culprit = model.culprit {
+                        Text(culprit)
+                            .font(.subheadline.weight(.medium))
+                            .lineLimit(1)
+                    }
                 }
             }
         }
@@ -854,7 +979,7 @@ struct ContentView: View {
     var appsCard: some View {
         let all = model.apps.filter { !$0.isDockerVM && $0.name != "Headroom" }
         let key: (AppUsage) -> Double = { sort == .memory ? $0.mb : $0.cpu }
-        let rows = Array(all.sorted { key($0) > key($1) }.prefix(5))
+        let rows = Array(all.sorted { key($0) > key($1) }.prefix(appCount))
         let top = max(rows.first.map(key) ?? 1, 1)
 
         return Card {
@@ -880,7 +1005,7 @@ struct ContentView: View {
                 .padding(.bottom, 2)
 
                 if rows.isEmpty {
-                    ProgressView().controlSize(.small).frame(height: 26 * 5)
+                    ProgressView().controlSize(.small).frame(height: 26 * CGFloat(appCount))
                 }
                 ForEach(rows) { app in
                     AppRow(app: app, sort: sort, share: key(app) / top, hot: isHot(app),
@@ -916,6 +1041,13 @@ struct ContentView: View {
                 }
                 .buttonStyle(.hoverPlain)
                 Spacer()
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.hoverPlain)
+                .help("Settings")
                 Button {
                     confirmQuit = true
                 } label: {
@@ -1135,6 +1267,8 @@ struct DockerCard: View {
                     }
                     .padding(.horizontal, 6)
                     .frame(height: 28)
+                } else if model.dockerState == .unresponsive {
+                    DockerDownNote(model: model)
                 } else {
                     ForEach(model.projects, id: \.name) { project in
                         ProjectRow(name: project.name, items: project.items, model: model)
@@ -1143,7 +1277,7 @@ struct DockerCard: View {
                         }
                     }
                     if model.projects.isEmpty {
-                        Text(model.dockerVM == nil ? "Docker isn't running" : "Loading containers…")
+                        Text("No containers running")
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 6)
@@ -1265,6 +1399,36 @@ struct ContainerRow: View {
     }
 }
 
+// Docker Desktop is running but its engine stopped answering, usually because
+// the VM died. Restarting brings it back, along with whatever was running.
+struct DockerDownNote: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        let count = model.lastRunning.count
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.warnText)
+                Text("Docker isn't responding").fontWeight(.medium)
+            }
+            Text(count == 0 ? "Restarting Docker usually fixes this."
+                 : "\(count) container\(count == 1 ? " was" : "s were") running. Restarting Docker brings \(count == 1 ? "it" : "them") back.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Restart Docker") { model.restartDocker() }
+                    .buttonStyle(.hoverProminent(.accentColor))
+            }
+        }
+        .font(.callout)
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.orange.opacity(0.12)))
+    }
+}
+
 // The VM grows to fit what containers once used and keeps it; only a Docker
 // restart gives it back. One line until clicked, then an inline confirm.
 struct SlackNote: View {
@@ -1306,6 +1470,126 @@ struct SlackNote: View {
     }
 }
 
+// MARK: - Settings view
+
+// Settings live inside the popover rather than in a separate window: windows
+// opened from a menu bar app tend to appear behind whatever is in front.
+struct SettingsView: View {
+    @ObservedObject var model: Model
+    let done: () -> Void
+    @AppStorage(Pref.menuText) private var menuText = MenuText.none.rawValue
+    @AppStorage(Pref.appCount) private var appCount = 5
+    @AppStorage(Pref.showDocker) private var showDocker = true
+    @State private var loginStatus = LoginItem.status
+    @State private var loginError: String?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Settings").font(.headline)
+                Spacer()
+                Button("Done", action: done)
+                    .buttonStyle(.hoverBordered)
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 28)
+
+            Card {
+                VStack(alignment: .leading, spacing: 10) {
+                    SettingRow("Open at login") {
+                        Toggle("Open at login", isOn: Binding(
+                            get: { loginStatus == .enabled || loginStatus == .requiresApproval },
+                            set: { on in
+                                do { try LoginItem.set(on); loginError = nil } catch {
+                                    loginError = error.localizedDescription
+                                }
+                                loginStatus = LoginItem.status
+                            }))
+                    }
+                    if loginStatus == .requiresApproval {
+                        HStack {
+                            Text("macOS needs your OK in Login Items.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                                .buttonStyle(.hoverSmall)
+                        }
+                    }
+                    if let loginError {
+                        Text(loginError).font(.caption).foregroundStyle(Color.warnText)
+                    }
+                    Divider()
+                    SettingRow("Menu bar shows") {
+                        Picker("Menu bar shows", selection: $menuText) {
+                            ForEach(MenuText.allCases, id: \.self) { Text($0.label).tag($0.rawValue) }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+            }
+
+            Card {
+                VStack(alignment: .leading, spacing: 10) {
+                    SettingRow("Apps to list") {
+                        Picker("Apps to list", selection: $appCount) {
+                            ForEach([5, 7, 10], id: \.self) { Text("\($0)").tag($0) }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                    }
+                    Divider()
+                    SettingRow("Show Docker") { Toggle("Show Docker", isOn: $showDocker) }
+                }
+            }
+
+            Card {
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Headroom \(version)").fontWeight(.medium)
+                        Text("Free and open source, MIT license").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("GitHub") {
+                        NSWorkspace.shared.open(URL(string: "https://github.com/julioest/headroom")!)
+                    }
+                    .buttonStyle(.hoverBordered)
+                }
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .onChange(of: menuText) { model.refreshLabel() }
+        .onAppear { loginStatus = LoginItem.status }
+    }
+
+    var version: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+}
+
+// Label on the left, control on the right, like System Settings.
+struct SettingRow<Control: View>: View {
+    let title: String
+    @ViewBuilder let control: () -> Control
+
+    init(_ title: String, @ViewBuilder control: @escaping () -> Control) {
+        self.title = title
+        self.control = control
+    }
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            control().labelsHidden()
+        }
+        .frame(minHeight: 22)
+    }
+}
+
 // MARK: - Menu bar
 
 // A capsule that fills as the Mac gets busy: the empty space at the top is the
@@ -1341,7 +1625,12 @@ struct MenuLabel: View {
     @ObservedObject var status: Status
 
     var body: some View {
-        Image(nsImage: MenuIcon.image(status.verdict))
+        HStack(spacing: 3) {
+            Image(nsImage: MenuIcon.image(status.verdict))
+            if !status.text.isEmpty {
+                Text(status.text).monospacedDigit()
+            }
+        }
     }
 }
 

@@ -12,12 +12,14 @@ A tiny macOS menu bar app that tells you if your Mac is fast or slow right now, 
 
 ## What it shows
 
-- **Status line:** *Running smoothly*, *A bit busy* or *Slowing down*, plus the reason. It goes by macOS's own memory pressure level, whether swap is growing, and whether CPU stays high for 30 seconds.
+- **Status line:** *Running smoothly*, *A bit busy* or *Slowing down*, plus the reason and the app responsible, like "Chrome is using 6.1 GB". It goes by macOS's own memory pressure level, whether swap is growing, and whether CPU stays high for 30 seconds.
 - **Memory, CPU and swap:** each with a graph of the last 15 minutes.
 - **Top apps:** the apps using the most memory or CPU, with helper processes counted under their app. Hover a row to quit the app.
-- **Docker:** containers grouped by compose project, if Docker is running. Hover to stop or start them. When the Docker VM holds a lot more memory than its containers use, Headroom offers to restart Docker, then starts your containers again.
+- **Docker:** containers grouped by compose project, if Docker is running. Hover to stop or start them. When the Docker VM holds a lot more memory than its containers use, or Docker stops responding, Headroom offers to restart Docker, then starts the containers that were running.
 
 The menu bar icon is a capsule that fills up as your Mac gets busy. The empty space at the top is your headroom. It turns orange when your Mac is busy and red when it's slow.
+
+Click the gear for **Settings**: open at login, show `MEM` or `CPU` percent next to the icon, how many apps to list, and whether to show Docker.
 
 ## Performance
 
@@ -44,7 +46,7 @@ Or clear the block from Terminal:
 xattr -dr com.apple.quarantine /Applications/Headroom.app
 ```
 
-To start it at login, add Headroom in **System Settings › General › Login Items**.
+To start it at login, turn on **Open at login** in Headroom's settings.
 
 ### Build from source
 
