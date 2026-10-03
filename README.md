@@ -21,7 +21,25 @@ The menu bar icon is a gauge. It turns orange when your Mac is busy and red when
 
 ## Install
 
-Needs macOS 14 or later and the Xcode command line tools.
+Download the `.dmg` from the [latest release](https://github.com/julioest/headroom/releases/latest), open it and drag Headroom to Applications. Needs macOS 14 or later, on Apple Silicon or Intel.
+
+Headroom isn't signed with an Apple Developer ID yet, so macOS blocks it the first time:
+
+1. Open Headroom. macOS says it can't verify the app. Click Done.
+2. Go to System Settings > Privacy & Security, scroll down and click Open Anyway next to the Headroom message.
+3. Open Headroom again and confirm.
+
+Or clear the block from Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Headroom.app
+```
+
+To start it at login, add Headroom in System Settings > General > Login Items.
+
+### Build from source
+
+Needs the Xcode command line tools.
 
 ```sh
 git clone https://github.com/julioest/headroom.git
@@ -30,13 +48,12 @@ cd headroom
 open Headroom.app
 ```
 
-To start it at login, add `Headroom.app` in System Settings > General > Login Items.
+`./release.sh 0.1.0` builds the universal app and packages the `.dmg` and `.zip` into `dist/`.
 
 ## Notes
 
 - Processes owned by other users, like WindowServer and system services, aren't listed. macOS doesn't let a regular app read them, and you can't quit them anyway.
 - Docker support expects Docker Desktop at `/Applications/Docker.app`, with its socket at `~/.docker/run/docker.sock`.
-- The build is ad hoc signed, so it's meant to run on the Mac you build it on.
 
 ## License
 
