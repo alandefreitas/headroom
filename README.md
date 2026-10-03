@@ -23,14 +23,9 @@ I use Docker every day for work, usually with a few copies of the same site runn
 
 The menu bar icon is a capsule that fills up as your Mac gets busy. The empty space at the top is your headroom. It turns orange when your Mac is busy and red when it's slow.
 
-<p>
-  <img src="screenshots/headroom-slowing-down.png" width="32%" alt="Headroom naming ffmpeg as the app slowing the Mac down">
-  <img src="screenshots/headroom-docker.png" width="32%" alt="Docker containers grouped by project, with clickable ports">
-</p>
+<img src="screenshots/headroom-slowing-down.png" width="40%" alt="Headroom naming ffmpeg as the app slowing the Mac down">
 
 Click the gear for **Settings**: open at login, show `MEM` or `CPU` percent next to the icon, how many apps to list, and whether to show Docker.
-
-<img src="screenshots/headroom-settings.png" width="66%" alt="Headroom settings in light and dark mode">
 
 ## Performance
 
