@@ -215,7 +215,7 @@ func appGroup(_ path: String) -> (name: String, bundle: String?) {
     if path.contains("Virtualization.VirtualMachine") {
         return ("Docker VM", "/Applications/Docker.app")
     }
-    if path.contains("com.apple.WebKit") {
+    if path.contains("com.apple.WebKit") || path.contains("/Safari.app/") {
         return ("Safari & WebKit", safariBundle)
     }
     if path.hasSuffix("/claude") || path.contains("/claude/versions/") { return ("Claude Code", nil) }
@@ -241,6 +241,8 @@ final class ProcScanner: @unchecked Sendable {
         return Double(tb.numer) / Double(tb.denom)
     }()
     private let systemDirs = ["/System/", "/usr/", "/sbin/", "/bin/", "/Library/Apple/"]
+    // Apple's own apps (Maps, Mail, Safari) live under /System but quit like any other app.
+    private let appleAppDirs = ["/System/Applications/", "/System/Cryptexes/App/System/Applications/"]
 
     // Processes owned by other users (WindowServer, daemons) can't be read
     // without root; they're macOS internals you couldn't quit anyway.
@@ -282,6 +284,7 @@ final class ProcScanner: @unchecked Sendable {
                 let path = String(cString: buf)
                 let (name, bundle) = appGroup(path)
                 let system = systemDirs.contains { path.hasPrefix($0) }
+                    && !appleAppDirs.contains { path.hasPrefix($0) }
                     && name != "Docker VM" && name != "Safari & WebKit"
                 owner = (name, bundle, system)
             }
