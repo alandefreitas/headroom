@@ -32,11 +32,12 @@ enum Verdict: Int, Comparable {
         case .slow: return "exclamationmark.triangle.fill"
         }
     }
-    var gauge: String {
+    // How full the menu bar capsule is, in points of its 18 pt glyph.
+    var level: CGFloat {
         switch self {
-        case .smooth: return "gauge.with.dots.needle.33percent"
-        case .busy: return "gauge.with.dots.needle.67percent"
-        case .slow: return "gauge.with.dots.needle.100percent"
+        case .smooth: return 4
+        case .busy: return 7.6
+        case .slow: return 11.6
         }
     }
     var color: Color {
@@ -1307,23 +1308,30 @@ struct SlackNote: View {
 
 // MARK: - Menu bar
 
-// A gauge whose needle and color follow the verdict. Smooth stays a plain
-// template image so it blends in like system icons. Built once per verdict.
+// A capsule that fills as the Mac gets busy: the empty space at the top is the
+// headroom. Smooth stays a plain template image so it blends in like system
+// icons; busy and slow are drawn in orange and red. Built once per verdict.
 @MainActor
 enum MenuIcon {
     private static var cache: [Verdict: NSImage] = [:]
 
     static func image(_ v: Verdict) -> NSImage {
         if let img = cache[v] { return img }
-        let base = NSImage(systemSymbolName: v.gauge, accessibilityDescription: v.title)!
-        let img: NSImage
-        if v == .smooth {
-            img = base
-            img.isTemplate = true
-        } else {
-            img = base.withSymbolConfiguration(.init(paletteColors: [v.nsColor])) ?? base
-            img.isTemplate = false
+        let color = v == .smooth ? NSColor.black : v.nsColor
+        // Flipped so the coordinates read top-down, like the design sketches.
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            color.set()
+            let capsule = NSBezierPath(roundedRect: NSRect(x: 4.75, y: 1.75, width: 8.5, height: 14.5),
+                                       xRadius: 4.25, yRadius: 4.25)
+            capsule.lineWidth = 1.5
+            capsule.stroke()
+            let r = min(2.4, v.level / 2)  // a short fill stays a pill, not a blob
+            NSBezierPath(roundedRect: NSRect(x: 6.6, y: 14.65 - v.level, width: 4.8, height: v.level),
+                         xRadius: r, yRadius: r).fill()
+            return true
         }
+        img.isTemplate = v == .smooth
+        img.accessibilityDescription = v.title
         cache[v] = img
         return img
     }

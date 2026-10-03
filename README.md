@@ -1,3 +1,5 @@
+<img src="icon/AppIcon.png" width="128" height="128" alt="Headroom app icon">
+
 # Headroom
 
 [![Latest release](https://img.shields.io/github/v/release/julioest/headroom)](https://github.com/julioest/headroom/releases/latest)
@@ -15,7 +17,7 @@ A tiny macOS menu bar app that tells you if your Mac is fast or slow right now, 
 - **Top apps:** the apps using the most memory or CPU, with helper processes counted under their app. Hover a row to quit the app.
 - **Docker:** containers grouped by compose project, if Docker is running. Hover to stop or start them. When the Docker VM holds a lot more memory than its containers use, Headroom offers to restart Docker, then starts your containers again.
 
-The menu bar icon is a gauge. It turns orange when your Mac is busy and red when it's slow.
+The menu bar icon is a capsule that fills up as your Mac gets busy. The empty space at the top is your headroom. It turns orange when your Mac is busy and red when it's slow.
 
 ## Performance
 
