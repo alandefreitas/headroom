@@ -1,9 +1,9 @@
 #!/bin/sh
-# Builds MemWatch.app next to this script. Run it with: open MemWatch.app
+# Builds Headroom.app next to this script. Run it with: open Headroom.app
 set -e
 cd "$(dirname "$0")"
 
-APP=MemWatch.app
+APP=Headroom.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
@@ -12,9 +12,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>MemWatch</string>
-  <key>CFBundleIdentifier</key><string>dev.julio.memwatch</string>
-  <key>CFBundleExecutable</key><string>MemWatch</string>
+  <key>CFBundleName</key><string>Headroom</string>
+  <key>CFBundleIdentifier</key><string>dev.julio.headroom</string>
+  <key>CFBundleExecutable</key><string>Headroom</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -23,6 +23,6 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </plist>
 EOF
 
-swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos14.0" MemWatch.swift -o "$APP/Contents/MacOS/MemWatch"
+swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos14.0" Headroom.swift -o "$APP/Contents/MacOS/Headroom"
 codesign --force --sign - "$APP"
 echo "Built $(pwd)/$APP"

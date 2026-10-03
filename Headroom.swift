@@ -1,4 +1,4 @@
-// MemWatch: a tiny menu bar app that answers "is my Mac fast or slow right now?"
+// Headroom: a tiny menu bar app that answers "is my Mac fast or slow right now?"
 // and shows which apps are to blame. Build with ./build.sh.
 //
 // Built to cost almost nothing: while the popover is closed it only reads a few
@@ -393,7 +393,7 @@ final class Model: ObservableObject {
     private var systemTimer: Timer?
     private var appTimer: Timer?
     private var openTicks = 0
-    private let queue = DispatchQueue(label: "memwatch.scan", qos: .utility)
+    private let queue = DispatchQueue(label: "headroom.scan", qos: .utility)
     private let procs = ProcScanner()
     private let docker = DockerScanner()
 
@@ -851,7 +851,7 @@ struct ContentView: View {
     // MARK: Apps
 
     var appsCard: some View {
-        let all = model.apps.filter { !$0.isDockerVM && $0.name != "MemWatch" }
+        let all = model.apps.filter { !$0.isDockerVM && $0.name != "Headroom" }
         let key: (AppUsage) -> Double = { sort == .memory ? $0.mb : $0.cpu }
         let rows = Array(all.sorted { key($0) > key($1) }.prefix(5))
         let top = max(rows.first.map(key) ?? 1, 1)
@@ -899,7 +899,7 @@ struct ContentView: View {
     var footer: some View {
         HStack {
             if confirmQuit {
-                Text("Quit MemWatch?").foregroundStyle(.secondary)
+                Text("Quit Headroom?").foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { confirmQuit = false }
                     .buttonStyle(.hoverBordered)
@@ -921,7 +921,7 @@ struct ContentView: View {
                     Image(systemName: "power")
                 }
                 .buttonStyle(.hoverPlain)
-                .help("Quit MemWatch")
+                .help("Quit Headroom")
             }
         }
         .font(.subheadline)
@@ -1338,7 +1338,7 @@ struct MenuLabel: View {
 }
 
 @main
-struct MemWatchApp: App {
+struct HeadroomApp: App {
     // @State, not @StateObject: the scene itself shouldn't re-render when the
     // model changes. Only the label (via Status) and the open popover observe.
     @State private var model = Model()
