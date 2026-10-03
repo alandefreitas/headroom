@@ -103,6 +103,11 @@ struct Container: Identifiable {
     }
 }
 
+// CPU as a share of the whole Mac. libproc and docker stats count per core, so
+// a busy app reads "815%"; everywhere on screen we show its share, "82%".
+let coreCount = Double(ProcessInfo.processInfo.activeProcessorCount)
+func cpuShare(_ perCore: Double) -> Double { min(perCore / coreCount, 100) }
+
 func formatMB(_ mb: Double) -> String {
     // From 1000 MB up, GB reads better than "1010 MB".
     mb >= 1000 ? String(format: "%.1f GB", mb / 1024) : String(format: "%.0f MB", mb)
@@ -1071,7 +1076,8 @@ struct ContentView: View {
         return Card {
             VStack(spacing: 2) {
                 HStack {
-                    Text(rows.contains { isHot($0) } ? "Slowing you down" : "Top apps")
+                    // Only when the Mac actually is slow: a big app on a healthy Mac isn't slowing you down.
+                    Text(model.status.verdict != .smooth && rows.contains { isHot($0) } ? "Slowing you down" : "Top apps")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -1102,7 +1108,7 @@ struct ContentView: View {
     }
 
     func isHot(_ app: AppUsage) -> Bool {
-        !app.isSystem && (sort == .memory ? app.mb >= 2048 : app.cpu >= 50)
+        !app.isSystem && (sort == .memory ? app.mb >= 2048 : cpuShare(app.cpu) >= 25)
     }
 
     // MARK: Footer
@@ -1304,7 +1310,7 @@ struct AppRow: View {
                 } else {
                     ShareBar(share: share, color: hot ? .orange : .accentColor)
                 }
-                Text(sort == .memory ? formatMB(app.mb) : String(format: "%.0f%%", app.cpu))
+                Text(sort == .memory ? formatMB(app.mb) : String(format: "%.0f%%", cpuShare(app.cpu)))
                     .monospacedDigit()
                     .fontWeight(hot ? .semibold : .regular)
                     .foregroundStyle(hot ? Color.warnText : Color.primary)
@@ -1322,7 +1328,7 @@ struct AppRow: View {
     }
 
     var tooltip: String {
-        var parts = [formatMB(app.mb), String(format: "%.0f%% CPU", app.cpu)]
+        var parts = [formatMB(app.mb), String(format: "%.0f%% CPU", cpuShare(app.cpu))]
         if app.count > 1 { parts.append("\(app.count) processes") }
         return parts.joined(separator: " · ")
     }
@@ -1484,31 +1490,41 @@ struct ContainerRow: View {
             if busy {
                 Text(stopped ? "Starting…" : "Stopping…").foregroundStyle(.secondary)
                 ProgressView().controlSize(.mini)
-            } else if hovering {
-                Button(stopped ? "Start" : "Stop") {
-                    stopped ? model.start([c.name]) : model.stop([c.name])
-                }
-                .buttonStyle(.hoverSmall)
-            } else if c.restarting {
-                Text("Crashing").foregroundStyle(Color.warnText)
             } else {
-                if let cpu = c.cpu, cpu >= 25, !stopped {
-                    Text(String(format: "%.0f%%", cpu))
-                        .foregroundStyle(Color.warnText)
-                        .monospacedDigit()
-                        .help("CPU, where 100% is one core")
-                }
-                if let port = c.port, !stopped {
-                    if c.isInfra {
-                        Text(":\(port)").foregroundStyle(.secondary).monospacedDigit()
-                    } else {
-                        // Web containers open in the browser; databases have nothing to show.
-                        Button(":\(port)") {
-                            NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
-                        }
-                        .buttonStyle(.hoverSmall)
-                        .help("Open localhost:\(port)")
+                if c.restarting {
+                    if !hovering { Text("Crashing").foregroundStyle(Color.warnText) }
+                } else {
+                    // CPU steps aside on hover to make room for Stop; the port stays,
+                    // since hovering the row is the only way to reach it.
+                    if let cpu = c.cpu, cpuShare(cpu) >= 5, !stopped, !hovering {
+                        Text(String(format: "%.0f%%", cpuShare(cpu)))
+                            .foregroundStyle(Color.warnText)
+                            .monospacedDigit()
+                            .help("Share of your Mac's CPU")
                     }
+                    if let port = c.port, !stopped {
+                        // A plain String: SwiftUI formats numbers inside text literals for the
+                        // locale, which turned port 8003 into "8,003".
+                        let label = ":" + String(port)
+                        if c.isInfra {
+                            Text(verbatim: label).foregroundStyle(.secondary).monospacedDigit()
+                        } else {
+                            // Web containers open in the browser; databases have nothing to show.
+                            Button {
+                                NSWorkspace.shared.open(URL(string: "http://localhost" + label)!)
+                            } label: {
+                                Text(verbatim: label)
+                            }
+                            .buttonStyle(.hoverSmall)
+                            .help(Text(verbatim: "Open localhost" + label))
+                        }
+                    }
+                }
+                if hovering {
+                    Button(stopped ? "Start" : "Stop") {
+                        stopped ? model.start([c.name]) : model.stop([c.name])
+                    }
+                    .buttonStyle(.hoverSmall)
                 }
             }
             Text(stopped ? "Stopped" : c.mb.map(formatMB) ?? "")
@@ -1531,7 +1547,7 @@ struct ContainerRow: View {
     // "web · up 9 hr · 7% CPU"
     var tooltip: String {
         var parts = [c.shortImage, "up " + c.uptime]
-        if let cpu = c.cpu { parts.append(String(format: "%.0f%% CPU", cpu)) }
+        if let cpu = c.cpu { parts.append(String(format: "%.0f%% CPU", cpuShare(cpu))) }
         return parts.joined(separator: " · ")
     }
 }
