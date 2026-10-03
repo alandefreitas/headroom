@@ -206,13 +206,17 @@ func sampleDisk() -> (free: Double, total: Double)? {
 
 // MARK: - Per-app scan (libproc, ~3 ms for all processes)
 
+// /Applications/Safari.app is a symlink into the Cryptex. Safari runs from the real path,
+// and the link itself gets the alias icon with the shortcut arrow.
+let safariBundle = ("/Applications/Safari.app" as NSString).resolvingSymlinksInPath
+
 // Group helpers under their app: ".../Google Chrome.app/.../Helper" -> "Google Chrome".
 func appGroup(_ path: String) -> (name: String, bundle: String?) {
     if path.contains("Virtualization.VirtualMachine") {
         return ("Docker VM", "/Applications/Docker.app")
     }
     if path.contains("com.apple.WebKit") {
-        return ("Safari & WebKit", "/Applications/Safari.app")
+        return ("Safari & WebKit", safariBundle)
     }
     if path.hasSuffix("/claude") || path.contains("/claude/versions/") { return ("Claude Code", nil) }
     // Plain string slicing: URL(fileURLWithPath:) stats the disk to check for a directory.
